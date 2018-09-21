@@ -10,6 +10,8 @@ import (
 	"net/http"
 	"os"
 	"time"
+
+	"golang.org/x/net/proxy"
 )
 
 const (
@@ -27,6 +29,7 @@ type Client struct {
 	DialContext func(context.Context, string, string) (net.Conn, error) // Only used for port 43 (whois) requests, not HTTP(S)
 	HTTPClient  *http.Client                                            // If nil, http.DefaultClient will be used
 	Timeout     time.Duration                                           // Deprecated (use a Context instead)
+	Proxy       string                                                  // Format as such 192.168.1.9:8080
 }
 
 // DefaultClient represents a shared whois client with a default timeout, HTTP
@@ -37,6 +40,14 @@ var DefaultClient = NewClient(DefaultTimeout)
 func NewClient(timeout time.Duration) *Client {
 	return &Client{
 		Timeout: timeout,
+	}
+}
+
+// NewProxyClient creates and initializes a new Client with the specified timeout and proxy.
+func NewProxyClient(timeout time.Duration, proxy string) *Client {
+	return &Client{
+		Timeout: timeout,
+		Proxy:   proxy,
 	}
 }
 
@@ -89,7 +100,39 @@ func (c *Client) FetchContext(ctx context.Context, req *Request) (*Response, err
 	if req.URL != "" {
 		return c.fetchHTTP(ctx, req)
 	}
+	if c.Proxy != "" {
+		return c.fetchWhoisWithProxy(ctx, req)
+	}
 	return c.fetchWhois(ctx, req)
+}
+
+func (c *Client) fetchWhoisWithProxy(ctx context.Context, req *Request) (*Response, error) {
+	var proxyDialer proxy.Dialer
+
+	if req.Host == "" {
+		return nil, &FetchError{fmt.Errorf("no request host for %s", req.Query), "unknown"}
+	}
+	dialer, err := proxy.SOCKS5("tcp", c.Proxy, nil, proxyDialer)
+	if err != nil {
+		return nil, err
+	}
+	conn, err := dialer.Dial("tcp", req.Host+":43")
+	// conn, err := c.dialContext(ctx, "tcp", req.Host+":43")
+	if err != nil {
+		return nil, &FetchError{err, req.Host}
+	}
+	defer conn.Close()
+	if _, err = conn.Write(req.Body); err != nil {
+		logError(err)
+		return nil, &FetchError{err, req.Host}
+	}
+	res := NewResponse(req.Query, req.Host)
+	if res.Body, err = ioutil.ReadAll(io.LimitReader(conn, DefaultReadLimit)); err != nil {
+		logError(err)
+		return nil, &FetchError{err, req.Host}
+	}
+	res.DetectContentType("")
+	return res, nil
 }
 
 func (c *Client) fetchWhois(ctx context.Context, req *Request) (*Response, error) {
